@@ -1,116 +1,178 @@
 #!/usr/bin/env bash
+# ============================================================================
+#  zen2-power-fedora
+#  ThinkPad T14s Gen 1 (Ryzen 5 PRO 4650U) — Power Optimization for Fedora
+# ----------------------------------------------------------------------------
+#  Automates the installation and configuration of ryzenadj, ryzen_smu, and
+#  auto-cpufreq with automatic AC / Battery profile switching via udev.
 #
-# ThinkPad T14s Gen 1 (Ryzen 5 PRO 4650U) Power Optimization Script for Fedora
-#
+#  Usage:  ./Ryzen_5_PRO_4650u\ -\ FEDORA.sh
+#  Note:   Run as a normal user with sudo privileges — NOT as root.
+# ============================================================================
 
-set -e
+set -euo pipefail
 
-# Color helpers
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+# ------------------------------- Constants ----------------------------------
 
-log() { echo -e "${BLUE}[INFO]${NC} $1"; }
-success() { echo -e "${GREEN}[OK]${NC} $1"; }
-error() {
-  echo -e "${RED}[ERROR]${NC} $1"
-  exit 1
+readonly SCRIPT_NAME="zen2-power-fedora"
+
+# Power-profile tunables (milliwatts / °C)
+readonly AC_STAPM=22000    AC_FAST=25000    AC_SLOW=22000    AC_TCTL=90
+readonly BAT_STAPM=10000   BAT_FAST=12000   BAT_SLOW=10000   BAT_TCTL=75
+
+# Paths
+readonly RYZENADJ_BIN="/usr/local/bin/ryzenadj"
+readonly PROFILE_AC="/usr/local/bin/ryzen-profile-ac"
+readonly PROFILE_BAT="/usr/local/bin/ryzen-profile-battery"
+readonly SMU_MODULE="ryzen_smu"
+readonly SMU_CONF="/etc/modules-load.d/${SMU_MODULE}.conf"
+readonly UDEV_RULE="/etc/udev/rules.d/99-ryzenadj-power.rules"
+
+# Build directories
+readonly BUILD_DIR_RYZENADJ="/tmp/ryzenadj"
+readonly BUILD_DIR_SMU="/tmp/ryzen_smu"
+readonly BUILD_DIR_AUTOCPUFREQ="/tmp/auto-cpufreq"
+
+# ------------------------------ Formatting ----------------------------------
+
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly BLUE='\033[0;34m'
+readonly BOLD='\033[1m'
+readonly NC='\033[0m'
+
+log()     { echo -e "${BLUE}${BOLD}[INFO]${NC}  $1"; }
+success() { echo -e "${GREEN}${BOLD}[ OK ]${NC}  $1"; }
+warn()    { echo -e "${RED}${BOLD}[WARN]${NC}  $1"; }
+die()     { echo -e "${RED}${BOLD}[FAIL]${NC}  $1" >&2; exit 1; }
+
+# ----------------------------- Helpers --------------------------------------
+
+# Print a section header to visually separate major steps.
+section() {
+  echo ""
+  echo -e "${BOLD}── $1${NC}"
 }
 
-# 1. Root Check
-if [ "$EUID" -eq 0 ]; then
-  error "Do not run this script as root directly. Run it as your normal user with sudo privileges."
-fi
-
-log "Starting setup for ThinkPad T14s Gen 1 on Fedora..."
-
-# 2. Install Development Headers and Build Tools
-log "Installing kernel headers, DKMS, and development tools..."
-sudo dnf install -y kernel-devel kernel-headers dkms gcc gcc-c++ git cmake make pciutils-devel
-
-# 3. Build and Install ryzenadj from Source
-log "Cloning and building ryzenadj from source..."
-if [ -d "/tmp/ryzenadj" ]; then
-  sudo rm -rf /tmp/ryzenadj
-fi
-
-git clone https://github.com/FlyGoat/RyzenAdj.git /tmp/ryzenadj
-cd /tmp/ryzenadj
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
-sudo make install
-cd -
-
-# 4. Install auto-cpufreq
-log "Installing auto-cpufreq..."
-sudo dnf install -y auto-cpufreq || {
-  log "auto-cpufreq not in default dnf repos, installing via git..."
-  git clone https://github.com/AdnanHodzic/auto-cpufreq.git /tmp/auto-cpufreq
-  cd /tmp/auto-cpufreq && sudo ./auto-cpufreq-installer --install
-  cd -
+# Clone a git repo into a target directory, cleaning any previous clone first.
+clone_fresh() {
+  local repo="$1" dest="$2"
+  [[ -d "$dest" ]] && sudo rm -rf "$dest"
+  git clone --depth 1 "$repo" "$dest"
 }
 
-# 5. Build and Install ryzen_smu-dkms (GitHub source)
-log "Cloning and installing ryzen_smu driver via DKMS..."
-if [ -d "/tmp/ryzen_smu" ]; then
-  sudo rm -rf /tmp/ryzen_smu
+# ========================== Pre-flight Checks ===============================
+
+if [[ "$EUID" -eq 0 ]]; then
+  die "Do not run this script as root. Run it as your normal user with sudo privileges."
 fi
 
-git clone https://github.com/leogx9r/ryzen_smu.git /tmp/ryzen_smu
-cd /tmp/ryzen_smu
-sudo make dkms-install
-cd -
+echo ""
+echo -e "${BOLD}${BLUE}  ⚡ ${SCRIPT_NAME}${NC}"
+echo -e "  Power optimisation for ThinkPad T14s Gen 1 · Fedora"
+echo ""
 
-# 6. Load Kernel Module & Configure Persistence
-log "Loading ryzen_smu module..."
-sudo modprobe ryzen_smu || true
+# ========================== 1. Dependencies =================================
 
-log "Setting up ryzen_smu auto-load on boot..."
-echo "ryzen_smu" | sudo tee /etc/modules-load.d/ryzen_smu.conf >/dev/null
+section "1/7  Installing kernel headers, DKMS, and build tools"
 
-# 7. Create Profile Scripts
-log "Creating power profile scripts in /usr/local/bin..."
+sudo dnf install -y \
+  kernel-devel kernel-headers dkms \
+  gcc gcc-c++ git cmake make \
+  pciutils-devel
 
-# AC Profile: 22W STAPM limit, max 90°C
-sudo tee /usr/local/bin/ryzen-profile-ac >/dev/null <<'EOF'
-#!/bin/bash
-/usr/local/bin/ryzenadj --stapm-limit=22000 --fast-limit=25000 --slow-limit=22000 --tctl-temp=90
+success "Build dependencies installed."
+
+# ========================== 2. RyzenAdj =====================================
+
+section "2/7  Building ryzenadj from source"
+
+clone_fresh "https://github.com/FlyGoat/RyzenAdj.git" "$BUILD_DIR_RYZENADJ"
+
+cmake -S "$BUILD_DIR_RYZENADJ" -B "${BUILD_DIR_RYZENADJ}/build" -DCMAKE_BUILD_TYPE=Release
+cmake --build "${BUILD_DIR_RYZENADJ}/build" -j "$(nproc)"
+sudo cmake --install "${BUILD_DIR_RYZENADJ}/build"
+
+success "ryzenadj installed to ${RYZENADJ_BIN}."
+
+# ========================== 3. auto-cpufreq ==================================
+
+section "3/7  Installing auto-cpufreq"
+
+if ! sudo dnf install -y auto-cpufreq 2>/dev/null; then
+  log "Package not found in default repos — building from source…"
+  clone_fresh "https://github.com/AdnanHodzic/auto-cpufreq.git" "$BUILD_DIR_AUTOCPUFREQ"
+  (cd "$BUILD_DIR_AUTOCPUFREQ" && sudo ./auto-cpufreq-installer --install)
+fi
+
+success "auto-cpufreq installed."
+
+# ========================== 4. ryzen_smu DKMS ================================
+
+section "4/7  Building ryzen_smu kernel module (DKMS)"
+
+clone_fresh "https://github.com/leogx9r/ryzen_smu.git" "$BUILD_DIR_SMU"
+
+(cd "$BUILD_DIR_SMU" && sudo make dkms-install)
+
+log "Loading ${SMU_MODULE} module…"
+sudo modprobe "$SMU_MODULE" || warn "modprobe failed — module may load after reboot."
+
+echo "$SMU_MODULE" | sudo tee "$SMU_CONF" >/dev/null
+
+success "${SMU_MODULE} installed and configured for auto-load."
+
+# ========================== 5. Profile Scripts ===============================
+
+section "5/7  Creating power-profile scripts"
+
+sudo tee "$PROFILE_AC" >/dev/null <<EOF
+#!/usr/bin/env bash
+# AC profile — ${AC_STAPM/000/}W STAPM, max ${AC_TCTL}°C
+exec ${RYZENADJ_BIN} \\
+  --stapm-limit=${AC_STAPM}  --fast-limit=${AC_FAST} \\
+  --slow-limit=${AC_SLOW}    --tctl-temp=${AC_TCTL}
 EOF
 
-# Battery Profile: 10W STAPM limit, max 75°C
-sudo tee /usr/local/bin/ryzen-profile-battery >/dev/null <<'EOF'
-#!/bin/bash
-/usr/local/bin/ryzenadj --stapm-limit=10000 --fast-limit=12000 --slow-limit=10000 --tctl-temp=75
+sudo tee "$PROFILE_BAT" >/dev/null <<EOF
+#!/usr/bin/env bash
+# Battery profile — ${BAT_STAPM/000/}W STAPM, max ${BAT_TCTL}°C
+exec ${RYZENADJ_BIN} \\
+  --stapm-limit=${BAT_STAPM}  --fast-limit=${BAT_FAST} \\
+  --slow-limit=${BAT_SLOW}    --tctl-temp=${BAT_TCTL}
 EOF
 
-sudo chmod +x /usr/local/bin/ryzen-profile-ac /usr/local/bin/ryzen-profile-battery
+sudo chmod +x "$PROFILE_AC" "$PROFILE_BAT"
 
-# 8. Create systemd Services
-log "Setting up systemd services..."
+success "Profile scripts created (${PROFILE_AC}, ${PROFILE_BAT})."
 
-sudo tee /etc/systemd/system/ryzenadj-ac.service >/dev/null <<'EOF'
+# ========================== 6. systemd + udev ================================
+
+section "6/7  Installing systemd services and udev rules"
+
+# --- AC service ---
+sudo tee /etc/systemd/system/ryzenadj-ac.service >/dev/null <<EOF
 [Unit]
 Description=Apply RyzenAdj AC Power Profile
 After=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/ryzen-profile-ac
+ExecStart=${PROFILE_AC}
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-sudo tee /etc/systemd/system/ryzenadj-battery.service >/dev/null <<'EOF'
+# --- Battery service ---
+sudo tee /etc/systemd/system/ryzenadj-battery.service >/dev/null <<EOF
 [Unit]
 Description=Apply RyzenAdj Battery Power Profile
 After=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/ryzen-profile-battery
+ExecStart=${PROFILE_BAT}
 
 [Install]
 WantedBy=multi-user.target
@@ -118,31 +180,38 @@ EOF
 
 sudo systemctl daemon-reload
 
-# 9. Configure udev Rule for Automatic AC/Battery Switching
-log "Setting up udev rules for power state switching..."
-
-sudo tee /etc/udev/rules.d/99-ryzenadj-power.rules >/dev/null <<'EOF'
+# --- udev rule ---
+sudo tee "$UDEV_RULE" >/dev/null <<EOF
+# Automatically switch power profiles on charger plug / unplug
 SUBSYSTEM=="power_supply", ATTR{online}=="1", RUN+="/usr/bin/systemctl start ryzenadj-ac.service"
 SUBSYSTEM=="power_supply", ATTR{online}=="0", RUN+="/usr/bin/systemctl start ryzenadj-battery.service"
 EOF
 
 sudo udevadm control --reload-rules
 
-# 10. Enable auto-cpufreq Service
-log "Disabling default power-profiles-daemon to prevent conflicts..."
-sudo systemctl disable --now power-profiles-daemon.service || true
+success "systemd services and udev rules installed."
 
-log "Enabling auto-cpufreq service..."
-sudo systemctl enable --now auto-cpufreq || true
+# ========================== 7. Enable & Apply ================================
 
-# 11. Initial Profile Trigger
-log "Applying power profile based on current AC state..."
-if [ "$(cat /sys/class/power_supply/AC*/online 2>/dev/null || echo 0)" -eq 1 ]; then
+section "7/7  Activating services"
+
+log "Disabling power-profiles-daemon to prevent conflicts…"
+sudo systemctl disable --now power-profiles-daemon.service 2>/dev/null || true
+
+log "Enabling auto-cpufreq…"
+sudo systemctl enable --now auto-cpufreq 2>/dev/null || true
+
+log "Applying initial power profile…"
+if [[ "$(cat /sys/class/power_supply/AC*/online 2>/dev/null || echo 0)" -eq 1 ]]; then
   sudo systemctl start ryzenadj-ac.service
-  log "Applied AC Profile (22W)."
+  success "AC profile applied (${AC_STAPM/000/}W STAPM, ${AC_TCTL}°C)."
 else
   sudo systemctl start ryzenadj-battery.service
-  log "Applied Battery Profile (10W)."
+  success "Battery profile applied (${BAT_STAPM/000/}W STAPM, ${BAT_TCTL}°C)."
 fi
 
-success "Script setup for FEDORA is complete!"
+# ================================ Done ======================================
+
+echo ""
+echo -e "${GREEN}${BOLD}  ✔  ${SCRIPT_NAME} — setup complete!${NC}"
+echo ""
